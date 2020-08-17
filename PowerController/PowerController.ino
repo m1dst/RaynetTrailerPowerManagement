@@ -1,26 +1,30 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
+#include <StateMachine.h>
+#include <neotimer.h>
 
-#define OLED_RESET 4
-
-#define LIGHTING_ENABLE     5
-#define BUZZER_ENABLE       6
-#define SOLENOID_ENABLE     7
+#define SPARE               2     // Currently unused.
+#define SOUND_BOMB          3     // The external burglar alarm
+#define LIGHTING_ENABLE     4     // Emergency lighting.
+#define SPARE_PWM           5     // Currently unused.
+#define BUZZER_ENABLE       6     // The small buzzer.
+#define SOLENOID_ENABLE     7     // The solenoid enable line.
+#define INPUT_ACTIVE        8     // The start button
+#define LED_ACTIVE          9     // Indicates if the Arduino power is now latched.
+#define LED_TIMEOUT         10    // Indicates if the unit is in timeout mode and will eventually shutdown if no interaction occurs.
+#define LED_OVERRIDE        11    // Indicates if override is active.
+#define INPUT_OVERRIDE      12    // If grounded (via the keyswitch) the startup and under/over voltage checks are ignored.
 #define ARDUINO_ENABLE      13    // Keeps the Arduino running.  If this pin goes low the Arduino will power off.
 
-#define LED_ACTIVE          9
-#define LED_TIMEOUT         10
-#define LED_OVERRIDE        11
+#define INPUT_ALARM_DISABLE A0    // Button to disable the alarm
+#define INPUT_BATTERY_SENSE A1    // Measures the voltage of the battery.
+#define INPUT_BUS_SENSE     A2    // Measures the voltage of the bus (controlled by the solenoid)
+#define INPUT_STOP_BUTTON   A3    // The stop button.
 
-#define INPUT_STOP_BUTTON   3
-#define INPUT_ACTIVE        8
-#define INPUT_OVERRIDE      12
+#define BUZZER_SUPPORTED          // If uncommented, the buzzer will sound during events such as timeout.  Disabled during development.
+#define DISPLAY_SUPPORTED         // If uncommented, the buzzer will sound during events such as timeout.  Disabled during development.
 
-#define INPUT_BATTERY_SENSE 1     //(analog)
-#define INPUT_BUS_SENSE     2     //(analog)
-
-// number of analog samples to take per reading
-#define NUM_SAMPLES 10
+#define NUM_SAMPLES 3             // number of analog samples to take per reading (voltage measurement)
 
 float noSolenoidVoltageLevel = 6;
 
@@ -36,61 +40,90 @@ unsigned int busSampleCount = 0;
 float busVoltageMax = 14.5;
 float busVoltageMin = 11.0;
 
-Adafruit_SSD1306 display(128, 32, &Wire, OLED_RESET, 400000, 100000);
+Neotimer splashTimer = Neotimer(2000); // 2s
+Neotimer startupTimer = Neotimer(30000); // 30s
+Neotimer shutdownTimer = Neotimer(300000); // 5 minutes
+Neotimer alarmTimer = Neotimer(30000); // 30s
 
-
-bool isShutdownMode = false;
-bool isTimeoutMode = true;
-unsigned long splashDurationMillis = 2000;
-unsigned long timeoutSeconds = 90;
-unsigned long millisAtTimeoutStart = 0;
-unsigned long millisAtTimeoutEnd = timeoutSeconds * 1000;
-
-// Size 2 = 10 chars.
-
-// this is the Width and Height of Display which is 128 xy 32
-#define LOGO16_GLCD_HEIGHT 32
-#define LOGO16_GLCD_WIDTH  128
-
-
-#if (SSD1306_LCDHEIGHT != 32)
-#error("Height incorrect, please fix Adafruit_SSD1306.h!");
+#ifdef DISPLAY_SUPPORTED
+  Adafruit_SSD1306 display(128, 32, &Wire, -1);
 #endif
+
+StateMachine machine = StateMachine();
+
+State* S0 = machine.addState(&state0);  // Start up
+State* S1 = machine.addState(&state1);  // Alarm timeout
+State* S2 = machine.addState(&state2);  // Alarm active
+State* S3 = machine.addState(&state3);  // Normal timeout
+State* S4 = machine.addState(&state4);  // Active
+State* S5 = machine.addState(&state5);  // Under voltage
+State* S6 = machine.addState(&state6);  // Over voltage
+State* S7 = machine.addState(&state7);  // Emergency
+State* S8 = machine.addState(&state8);  // Shutdown timeout
+State* S9 = machine.addState(&state9);  // Qrt
 
 void setup()   {
   Serial.begin(115200);
+  Serial.println("Starting...");
 
-  pinMode(INPUT_STOP_BUTTON, INPUT_PULLUP);
+  pinMode(INPUT_STOP_BUTTON, INPUT);
   pinMode(INPUT_ACTIVE, INPUT_PULLUP);
   pinMode(INPUT_OVERRIDE, INPUT_PULLUP);
 
+  pinMode(SOUND_BOMB, OUTPUT);      digitalWrite(SOUND_BOMB, LOW);
   pinMode(LIGHTING_ENABLE, OUTPUT); digitalWrite(LIGHTING_ENABLE, HIGH);
   pinMode(BUZZER_ENABLE, OUTPUT);   digitalWrite(BUZZER_ENABLE, LOW);
   pinMode(SOLENOID_ENABLE, OUTPUT); digitalWrite(SOLENOID_ENABLE, LOW);
   pinMode(ARDUINO_ENABLE, OUTPUT);  digitalWrite(ARDUINO_ENABLE, HIGH);
+  pinMode(SPARE_PWM, OUTPUT);  digitalWrite(SPARE_PWM, HIGH);
 
-  pinMode(LED_ACTIVE, OUTPUT);    digitalWrite(LED_ACTIVE, HIGH);
-  pinMode(LED_TIMEOUT, OUTPUT);   digitalWrite(LED_TIMEOUT, HIGH);
+  pinMode(LED_ACTIVE, OUTPUT);    digitalWrite(LED_ACTIVE, LOW);
+  pinMode(LED_TIMEOUT, OUTPUT);   digitalWrite(LED_TIMEOUT, LOW);
   pinMode(LED_OVERRIDE, OUTPUT);  digitalWrite(LED_OVERRIDE, LOW);
 
-  if (digitalRead(INPUT_ACTIVE) == LOW || IsOverride())
+  // Setup the state machine transitions
+  S0->addTransition(&transitionS0S1, S1);
+  S0->addTransition(&transitionS0S4, S4);
+  S1->addTransition(&transitionS1S2, S2);
+  S1->addTransition(&transitionS1S3, S3);
+  S2->addTransition(&transitionS2S9, S9);
+  S3->addTransition(&transitionS3S4, S4);
+  S3->addTransition(&transitionS3S9, S9);
+  S4->addTransition(&transitionToEmergency, S7);
+  S4->addTransition(&transitionS4S5, S5);
+  S4->addTransition(&transitionS4S6, S6);
+  S4->addTransition(&transitionS4S8, S8);
+  S5->addTransition(&transitionS5S4, S4);
+  S5->addTransition(&transitionToEmergency, S7);
+  S5->addTransition(&transitionToQrt, S9);
+  S6->addTransition(&transitionS6S4, S4);
+  S6->addTransition(&transitionToEmergency, S7);
+  S6->addTransition(&transitionToQrt, S9);
+  S7->addTransition(&transitionFromEmergency, S4);
+  S7->addTransition(&transitionToQrt, S9);
+  S8->addTransition(&transitionS8S4, S4);
+  S8->addTransition(&transitionS8S9, S9);
+  S9->addTransition(&transitionS9S0, S0);
+
+  // Check if the start button was pressed or the override key is enabled and power up the Arduino.
+  if (digitalRead(INPUT_ACTIVE) == LOW || digitalRead(INPUT_OVERRIDE) == LOW)
   {
     digitalWrite(ARDUINO_ENABLE, HIGH);
-    digitalWrite(LED_ACTIVE, HIGH);
   }
 
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);  // initialize with the I2C addr 0x3C (for the 128x32)
+  if (digitalRead(INPUT_OVERRIDE) == LOW)
+  {
+    digitalWrite(LED_OVERRIDE, HIGH);
+  }
 
-  // Clear the buffer.
-  display.clearDisplay();
+  #ifdef DISPLAY_SUPPORTED
+    // Initialise the OLED
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
+      Serial.println(F("SSD1306 allocation failed"));
+      for(;;); // Don't proceed, loop forever
+    }
+  #endif
 
-  oledText("V1.0", 6, 4, 4, true);
-  tone(BUZZER_ENABLE, 1000); // Send 1KHz sound signal...
-  delay(100);
-  tone(BUZZER_ENABLE, 1500); // Send 1.5KHz sound signal...
-  delay(100);
-  noTone(BUZZER_ENABLE);
- 
 }
 
 // Calibrating the voltage measurement
@@ -101,142 +134,392 @@ void setup()   {
 // 10.02 ÷ 0.9 = 11.133
 // Now use this value in the Arduino sketch code.
 
-
-void loop() {
-
-  // Check if the stop button is pressed.  If so, switch off.
-  CheckForShutdownButton();
-
-  while (digitalRead(ARDUINO_ENABLE) == LOW && digitalRead(INPUT_ACTIVE) == HIGH)
-  {
-    display.clearDisplay();
-  }
-
-  if (digitalRead(INPUT_ACTIVE) == LOW)
-  {
-    digitalWrite(ARDUINO_ENABLE, HIGH);
-    digitalWrite(LED_ACTIVE, HIGH);
-  }
-
-  digitalWrite(LED_OVERRIDE, IsOverride());
-
+void loop()
+{
+  machine.run();
   UpdateBatteryVoltage();
   UpdateBusVoltage();
+}
 
-  while (IsBatteryVoltageOutOfRange() || (IsBusVoltageOutOfRange() && !isTimeoutMode) )
-  {
+//=======================================
 
-    // Check if the stop button is pressed.  If so, switch off.
-    CheckForShutdownButton();
+void state0() {
+  if (machine.executeOnce) {
+    //Serial.println("State 0 - Splash");
+    #ifdef DISPLAY_SUPPORTED
+      display.clearDisplay();
+      oledText("V2.0", 16, 2, 4, true);
+    #endif
 
     tone(BUZZER_ENABLE, 1000);
-    display.clearDisplay();
+    delay(100);
+    tone(BUZZER_ENABLE, 2000);
+    delay(100);
+    noTone(BUZZER_ENABLE);
 
-    if (busVoltage < noSolenoidVoltageLevel)
-    {
-      oledText("NO DC BUS", 5, 0, 2, false);
-      oledText("EMERGENCY?", 0, 18, 2, false);
-      digitalWrite(LIGHTING_ENABLE, HIGH);  // Enable the emergency lights.
-    }
-    else if (IsBusVoltageOutOfRange())
-    {
-      digitalWrite(SOLENOID_ENABLE, IsSolenoidAllowedToBeOn());
-      oledText("BUS:" + getVoltageString(busVoltage, 5, 1) + "V", 0, 1, 2, false);
-      oledText("PLS CHECK!", 0, 18, 2, false);
-    }
-    else if (IsBatteryVoltageOutOfRange())
-    {
-      digitalWrite(SOLENOID_ENABLE, IsSolenoidAllowedToBeOn());
-      oledText("BAT:" + getVoltageString(busVoltage, 5, 1) + "V", 0, 1, 2, false);
-      oledText("PLS CHECK!", 0, 18, 2, false);
-    }
+    splashTimer.start();
+  }
+}
 
-    display.display();
-    UpdateBatteryVoltage();
-    UpdateBusVoltage();
-    CheckTimeout();
+// Alarm timeout
+void state1() {
+  
+  if (machine.executeOnce) {
+    //Serial.println("State 1 - Alarm timer initiated");
+    alarmTimer.start();
+    digitalWrite(LED_TIMEOUT, LOW); // Disable the TIMEOUT led.
+    #ifdef DISPLAY_SUPPORTED
+      display.clearDisplay();
+      oledText("ALARM IN", 15, 0, 2, false);
+    #endif
   }
 
-  noTone(BUZZER_ENABLE);
+  unsigned long remainingSeconds = (alarmTimer.get() - alarmTimer.getEllapsed()) / 1000;
+  int runHours = remainingSeconds / 3600;
+  int secsRemaining = remainingSeconds % 3600;
+  int runMinutes = secsRemaining / 60;
+  int runSeconds = secsRemaining % 60;
 
-  isTimeoutMode = isTimeoutMode && digitalRead(INPUT_ACTIVE) == HIGH && !IsOverride();
-  digitalWrite(LED_TIMEOUT, isTimeoutMode);
-  digitalWrite(LIGHTING_ENABLE, isTimeoutMode);
-  if(!isTimeoutMode)
-  {
-      DisableTimeout();
+  char buf[9];
+  sprintf(buf, "%02d:%02d:%02d", runHours, runMinutes, runSeconds);
+  #ifdef DISPLAY_SUPPORTED
+    display.fillRect(0, 18, 128, 32, BLACK);
+    oledText(buf, 15, 18, 2, true);
+  #endif
+  //Serial.print("ALARM: ");
+  //Serial.println(buf);
+
+  #ifdef BUZZER_SUPPORTED
+    tone(BUZZER_ENABLE, 1000);
+    delay(200);
+    noTone(BUZZER_ENABLE);
+  #endif
+  
+}
+
+void state2() {
+  if (machine.executeOnce) {
+    //Serial.println("State 2 - Alarm Activated");
+    digitalWrite(SOUND_BOMB, HIGH);
+    digitalWrite(LED_TIMEOUT, LOW); // Disable the TIMEOUT led.
+    #ifdef DISPLAY_SUPPORTED
+      display.clearDisplay();
+      oledText("ALARM", 5, 2, 4, true);
+    #endif
+
+    // Trigger a pulse on the 3G tracker SOS button. (1 second)
+   digitalWrite(SPARE_PWM, HIGH);
+   delay(1000);
+   digitalWrite(SPARE_PWM, LOW);
+  }
+}
+
+void state3() {
+  
+  if (machine.executeOnce) {
+  //Serial.println("State 3 - Normal Timeout");
+    digitalWrite(SOUND_BOMB, LOW);
+    digitalWrite(LED_TIMEOUT, HIGH); // Enable the TIMEOUT led.
+    #ifdef DISPLAY_SUPPORTED
+      display.clearDisplay();
+      oledText("TIMEOUT IN", 0, 0, 2, false);
+    #endif
+    startupTimer.start();
+ }
+
+  unsigned long remainingSeconds = (startupTimer.get() - startupTimer.getEllapsed()) / 1000;
+  int runHours = remainingSeconds / 3600;
+  int secsRemaining = remainingSeconds % 3600;
+  int runMinutes = secsRemaining / 60;
+  int runSeconds = secsRemaining % 60;
+
+  char buf[9];
+  sprintf(buf, "%02d:%02d:%02d", runHours, runMinutes, runSeconds);
+  #ifdef DISPLAY_SUPPORTED
+    display.fillRect(0, 18, 128, 32, BLACK);
+    oledText(buf, 15, 18, 2, true);
+  #endif
+  //Serial.print("TIMEOUT: ");
+  //Serial.println(buf);
+
+  #ifdef BUZZER_SUPPORTED
+    if (secsRemaining <= 10 && secsRemaining % 2 == 0)
+    {
+      tone(BUZZER_ENABLE, 1500);
+      delay(200);
+      noTone(BUZZER_ENABLE);
+    }
+  #endif
+
+}
+
+void state4() {
+  if (machine.executeOnce) {
+    //Serial.println("State 4 - Active");
+    digitalWrite(SOUND_BOMB, LOW); // Disable the alarm.
+    digitalWrite(LIGHTING_ENABLE, LOW); // Disable the emergency lighting.
+    digitalWrite(LED_TIMEOUT, LOW); // Disable the TIMEOUT led.
+    digitalWrite(LED_ACTIVE, HIGH); // Light the ACTIVE led.
+    digitalWrite(SOLENOID_ENABLE, HIGH); // Enable the solenoid.
+
+    #ifdef BUZZER_SUPPORTED
+      noTone(BUZZER_ENABLE);
+    #endif
   }
 
-  if (millis() > splashDurationMillis)
-  {
+  #ifdef DISPLAY_SUPPORTED
     display.clearDisplay();
+    char buf[9];
+    dtostrf(batteryVoltage, 5, 2, buf);
+    strncat(buf, "V", 2);
+    oledText(buf, 2, 2, 4, true);
+  #endif
 
-    if(!isShutdownMode)
-    {
-      oledText("BATTERY:          ", 4, 3, 1, false);
-      oledText(getVoltageString(batteryVoltage, 7, 3) + " V", 72, 3, 1, false);
+  //Serial.print("BUS: ");
+  //Serial.print(busVoltage);
+  //Serial.print("V   - BATTERY: ");
+  //Serial.print(batteryVoltage);
+  //Serial.println("V");
   
-      oledText("DC BUS :           ", 4, 12, 1, false);
-      oledText(getVoltageString(busVoltage, 7, 3) + " V", 72, 12, 1, false);
-    }
-  
-    if (isTimeoutMode)
-    {
+}
 
-      CheckTimeout();
+void state5() {
 
-      unsigned long totalSecondsUntilShutdown = (millisAtTimeoutEnd - millis()) / 1000;
-      int runHours = totalSecondsUntilShutdown / 3600;
-      int secsRemaining = totalSecondsUntilShutdown % 3600;
-      int runMinutes = secsRemaining / 60;
-      int runSeconds = secsRemaining % 60;
+  if (machine.executeOnce) {
+    //Serial.println("State 5 - Under Voltage");
+    #ifdef BUZZER_SUPPORTED
+      tone(BUZZER_ENABLE, 1500);
+    #endif
+    #ifdef DISPLAY_SUPPORTED
+      display.clearDisplay();
+      oledText("UNDER", 5, 2, 4, true);
+    #endif
+  }
 
-      char buf[21];
-
-      if(isShutdownMode)
-      {
-        oledText(" SHUTDOWN", 4, 3, 2, false);
-        sprintf(buf, "      %02d:%02d:%02d      ", runHours, runMinutes, runSeconds);
-      }
-       else
-      {
-        sprintf(buf, "TIMEOUT IN: %02d:%02d:%02d", runHours, runMinutes, runSeconds);
-      }
-      
-      oledText(String(buf), 4, 21, 1, false);
-
-      if (secsRemaining <= 10 && secsRemaining % 2 == 0)
-      {
-        tone(BUZZER_ENABLE, 1500);
-        delay(100);
-        noTone(BUZZER_ENABLE);
-      }
-
-    }
-    else
-    {
-
-      digitalWrite(SOLENOID_ENABLE, IsSolenoidAllowedToBeOn());
-
-      if (IsOverride())
-      {
-        oledText("STATUS :    OVERRIDE", 4, 21, 1, false);
-      }
-      else
-      {
-        oledText("STATUS :      NORMAL", 4, 21, 1, false);
-      }
-
-    }
-
-    display.drawRect(0, 0, 128, 32, WHITE);
-    display.display();
-
+  //Serial.print("Under Voltage - ");
+  if(busVoltage <= busVoltageMin)
+  {
+    //Serial.print("BUS - ");
+    //Serial.print(busVoltage);
+    //Serial.print("V - (<=");
+    //Serial.print(busVoltageMin);
+    //Serial.println(")");
+  } 
+  else if (batteryVoltage <= batteryVoltageMin)
+  {
+    //Serial.print("BATTERY - ");
+    //Serial.print(batteryVoltage);
+    //Serial.print("V - (<=");
+    //Serial.print(batteryVoltageMin);
+    //Serial.println(")");
   }
 
 }
 
+void state6() {
 
+  if (machine.executeOnce) {
+    //Serial.println("State 6 - Over Voltage");
+    #ifdef BUZZER_SUPPORTED
+      tone(BUZZER_ENABLE, 1500);
+    #endif
+    #ifdef DISPLAY_SUPPORTED
+      display.clearDisplay();
+      oledText("OVER", 18, 2, 4, true);
+    #endif
+  }
+
+  //Serial.print("Over Voltage - ");
+  if(busVoltage >= busVoltageMax)
+  {
+    //Serial.print("BUS - ");
+    //Serial.print(busVoltage);
+    //Serial.print("V - (>=");
+    //Serial.print(busVoltageMax);
+    //Serial.println(")");
+  } 
+  else if (batteryVoltage >= batteryVoltageMax)
+  {
+    //Serial.print("BATTERY - ");
+    //Serial.print(batteryVoltage);
+    //Serial.print("V - (>=");
+    //Serial.print(batteryVoltageMax);
+    //Serial.println(")");
+  }
+
+}
+
+void state7() {
+
+  if (machine.executeOnce) {
+    //Serial.println("State 7 - Emergency");
+
+    #ifdef BUZZER_SUPPORTED
+      tone(BUZZER_ENABLE, 1500);
+    #endif
+
+    #ifdef DISPLAY_SUPPORTED
+      display.clearDisplay();
+      oledText("NO BUS!", 25, 0, 2, false);
+      oledText("Emergency?", 6, 16, 2, true);
+    #endif
+
+    digitalWrite(LIGHTING_ENABLE, HIGH); // Enable the emergency lighting.
+  }
+}
+
+void state8() {
+  
+  if (machine.executeOnce) {
+    //Serial.println("State 8 - Shutdown timer initiated");
+    digitalWrite(LED_TIMEOUT, HIGH);     // Enable the TIMEOUT led.
+    digitalWrite(LIGHTING_ENABLE, HIGH); // Enable the emergency lighting.
+    digitalWrite(SOLENOID_ENABLE, LOW); // Disable the solenoid.
+    shutdownTimer.start();
+    #ifdef DISPLAY_SUPPORTED
+      display.clearDisplay();
+      oledText("SHUTDOWN", 15, 0, 2, false);
+    #endif
+  }
+
+  unsigned long remainingSeconds = (shutdownTimer.get() - shutdownTimer.getEllapsed()) / 1000;
+  int runHours = remainingSeconds / 3600;
+  int secsRemaining = remainingSeconds % 3600;
+  int runMinutes = secsRemaining / 60;
+  int runSeconds = secsRemaining % 60;
+
+  char buf[9];
+  sprintf(buf, "%02d:%02d:%02d", runHours, runMinutes, runSeconds);
+  #ifdef DISPLAY_SUPPORTED
+    display.fillRect(0, 18, 128, 32, BLACK);
+    oledText(buf, 15, 18, 2, true);
+  #endif
+  //Serial.print("SHUTDOWN: ");
+  //Serial.println(buf);
+
+  #ifdef BUZZER_SUPPORTED
+    if (secsRemaining <= 10 && secsRemaining % 2 == 0)
+    {
+      tone(BUZZER_ENABLE, 1500);
+      delay(200);
+      noTone(BUZZER_ENABLE);
+    }
+  #endif
+  
+}
+
+void state9() {
+    if (machine.executeOnce) {
+      //Serial.println("State 9 - QRT");
+      #ifdef DISPLAY_SUPPORTED
+        display.clearDisplay();
+        oledText("QRT!", 22, 2, 4, true);
+      #endif
+      digitalWrite(ARDUINO_ENABLE, LOW);
+      digitalWrite(LIGHTING_ENABLE, LOW);
+      digitalWrite(BUZZER_ENABLE, LOW);
+      digitalWrite(SOLENOID_ENABLE, LOW);
+      digitalWrite(SOUND_BOMB, LOW);
+      digitalWrite(SPARE_PWM, LOW);
+      digitalWrite(LED_ACTIVE, LOW);
+      digitalWrite(LED_TIMEOUT, LOW);
+      digitalWrite(LED_OVERRIDE, LOW);
+    }
+}
+
+
+// ==== Transitions ===========================================
+bool transitionS0S1() {
+  return (splashTimer.done()) ? true : false;
+}
+
+bool transitionS0S4() {
+  return digitalRead(INPUT_ACTIVE) == LOW || digitalRead(INPUT_OVERRIDE) == LOW;
+}
+
+bool transitionS1S2() {
+  return (alarmTimer.done()) ? true : false;
+}
+
+bool transitionS1S3() {
+    // Check if the alarm disable button is pressed.
+  return digitalRead(INPUT_ALARM_DISABLE) == LOW;
+}
+
+bool transitionS2S9() {
+  // Check if the alarm disable button is pressed.
+  return digitalRead(INPUT_ALARM_DISABLE) == LOW;
+}
+
+bool transitionS3S4() {
+  return digitalRead(INPUT_ACTIVE) == LOW;
+}
+
+bool transitionS3S9() {
+  if(digitalRead(INPUT_STOP_BUTTON) == LOW)
+    return true;
+
+  return (startupTimer.done()) ? true : false;
+}
+
+bool transitionS4S5() {
+
+  if(digitalRead(INPUT_OVERRIDE) == LOW)
+    return false;
+
+  if(busVoltage < noSolenoidVoltageLevel)
+    return false;
+
+  if(batteryVoltage < noSolenoidVoltageLevel)
+    return false;
+
+  return busVoltage <= busVoltageMin || batteryVoltage <= batteryVoltageMin;
+}
+bool transitionS4S6() {
+  if(digitalRead(INPUT_OVERRIDE) == LOW)
+    return false;
+
+  return busVoltage >= busVoltageMax || batteryVoltage >= batteryVoltageMax;
+}
+bool transitionToEmergency() {
+  return busVoltage <= noSolenoidVoltageLevel;
+}
+
+bool transitionS4S8() {
+  return digitalRead(INPUT_STOP_BUTTON) == LOW;
+}
+
+bool transitionS5S4() {
+  return busVoltage > busVoltageMin && batteryVoltage >= batteryVoltageMin;
+}
+
+bool transitionS6S4() {
+  return busVoltage < busVoltageMax && batteryVoltage < batteryVoltageMax;
+}
+bool transitionFromEmergency() {
+  return busVoltage >= noSolenoidVoltageLevel;
+}
+bool transitionToQrt() {
+  return digitalRead(INPUT_STOP_BUTTON) == LOW;
+}
+bool transitionS8S4() {
+  return digitalRead(INPUT_ACTIVE) == LOW;
+}
+
+bool transitionS8S9() {
+  // We debounce the stop button by ignoring it for the first 2 seconds.
+  if(shutdownTimer.getEllapsed() > 2000 && digitalRead(INPUT_STOP_BUTTON) == LOW)
+    return true;
+
+  return (shutdownTimer.done()) ? true : false;
+}
+
+bool transitionS9S0() {
+  return digitalRead(INPUT_ACTIVE) == LOW;
+}
+
+
+#ifdef DISPLAY_SUPPORTED
 /*
    oledText(String text, int x, int y,int size, boolean d)
    text is the text string to be printed
@@ -245,62 +528,22 @@ void loop() {
    z is the text size, 1, 2, 3 etc
    updateDisplay is either "true" or "false".
 */
-void oledText(String text, int x, int y, int size, boolean updateDisplay) {
-
+void* oledText(char* text, int x, int y, int size, boolean updateDisplay) {
   display.setTextSize(size);
-  display.setTextColor(WHITE);
+  display.setTextColor(SSD1306_WHITE);
   display.setCursor(x, y);
   display.println(text);
   if (updateDisplay) {
     display.display();
   }
 }
+#endif
 
-String getVoltageString(double value, int len, int precision)
+char* getVoltageString(double value, int len, int precision)
 {
   char outstr[len];
   dtostrf(value, len, precision, outstr);
-  return String(outstr);
-}
-
-
-void ShutdownArduino()
-{
-  Serial.println("SHUTDOWN");
-  isTimeoutMode = true;
-  isShutdownMode = true;
-  digitalWrite(LIGHTING_ENABLE, HIGH);
-  digitalWrite(LED_TIMEOUT, HIGH);
-  digitalWrite(BUZZER_ENABLE, LOW);
-  digitalWrite(SOLENOID_ENABLE, LOW);
-  digitalWrite(LED_ACTIVE, LOW);
-  digitalWrite(LED_OVERRIDE, LOW);
-}
-
-
-void PowerOffArduino()
-{
-  Serial.println("QRT");
-  display.clearDisplay();
-  oledText("QRT!", 22, 4, 4, true);
-  digitalWrite(ARDUINO_ENABLE, LOW);
-  digitalWrite(LIGHTING_ENABLE, LOW);
-  digitalWrite(BUZZER_ENABLE, LOW);
-  digitalWrite(SOLENOID_ENABLE, LOW);
-  digitalWrite(LED_ACTIVE, LOW);
-  digitalWrite(LED_TIMEOUT, LOW);
-  digitalWrite(LED_OVERRIDE, LOW);
-  while (1 == 1)
-  {
-    // Should never get here.
-  }
-}
-
-void DisableTimeout()
-{
-  isShutdownMode = false;
-  isTimeoutMode = false;
-  millisAtTimeoutEnd = millis() + (timeoutSeconds * 1000);
+  return outstr;
 }
 
 void UpdateBatteryVoltage()
@@ -311,14 +554,9 @@ void UpdateBatteryVoltage()
     batterySampleCount ++;
   }
   batteryVoltage = ((float)batterySum / (float)NUM_SAMPLES * 5.1) / 1024.0;
-  batteryVoltage = batteryVoltage * 10.83;  // Calibration fix.
+  batteryVoltage = batteryVoltage * 11.365;  // Calibration fix.
   batterySum = 0;
   batterySampleCount = 0;
-}
-
-bool IsBatteryVoltageOutOfRange()
-{
-  return batteryVoltage <= batteryVoltageMin || batteryVoltage  >= batteryVoltageMax;
 }
 
 void UpdateBusVoltage()
@@ -329,64 +567,7 @@ void UpdateBusVoltage()
     busSampleCount ++;
   }
   busVoltage = ((float)busSum / (float)NUM_SAMPLES * 5.1) / 1024.0;
-  busVoltage = busVoltage * 10.83;  // Calibration fix.
+  busVoltage = busVoltage * 11.42;  // Calibration fix.
   busSum = 0;
   busSampleCount = 0;
-}
-
-bool IsBusVoltageOutOfRange()
-{
-  return busVoltage <= busVoltageMin || busVoltage  >= busVoltageMax;
-}
-
-bool IsBusConnected()
-{
-  return busVoltage > 1;
-}
-
-bool IsSolenoidAllowedToBeOn()
-{
-  if (isTimeoutMode)
-    return false;
-  if (IsBusVoltageOutOfRange() && busVoltage > noSolenoidVoltageLevel)
-    return false;
-  if (IsBatteryVoltageOutOfRange())
-    return false;
-
-  return true;
-}
-
-bool IsOverride()
-{
-  return digitalRead(INPUT_OVERRIDE) == LOW;
-}
-
-void CheckTimeout()
-{
-  unsigned long totalSecondsUntilShutdown = (millisAtTimeoutEnd - millis()) / 1000;
-  if (isTimeoutMode && totalSecondsUntilShutdown == 0)
-  {
-    PowerOffArduino();
-  }
-}
-
-void CheckForShutdownButton()
-{
-  if (digitalRead(INPUT_STOP_BUTTON) == LOW && !IsOverride())
-  {
-    if (isTimeoutMode)
-    {
-      PowerOffArduino();
-    }
-    else
-    {
-      ShutdownArduino();
-    }
-    
-    // Halt the app whilst the button is pressed.
-    while(digitalRead(INPUT_STOP_BUTTON) == LOW)
-    {
-    }
-    
-  }
 }

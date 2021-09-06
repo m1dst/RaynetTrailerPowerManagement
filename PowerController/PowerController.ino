@@ -1,9 +1,9 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <StateMachine.h>
-#include <neotimer.h>
 
 #define SPARE               2     // Currently unused.
+#include <neotimer.h>
 #define SOUND_BOMB          3     // The external burglar alarm
 #define LIGHTING_ENABLE     4     // Emergency lighting.
 #define SPARE_PWM           5     // Currently unused.
@@ -44,6 +44,7 @@ Neotimer splashTimer = Neotimer(2000); // 2s
 Neotimer startupTimer = Neotimer(30000); // 30s
 Neotimer shutdownTimer = Neotimer(300000); // 5 minutes
 Neotimer alarmTimer = Neotimer(30000); // 30s
+Neotimer alarmAlarmTimer = Neotimer(900000); // 15 minutes
 
 #ifdef DISPLAY_SUPPORTED
   Adafruit_SSD1306 display(128, 32, &Wire, -1);
@@ -75,7 +76,7 @@ void setup()   {
   pinMode(BUZZER_ENABLE, OUTPUT);   digitalWrite(BUZZER_ENABLE, LOW);
   pinMode(SOLENOID_ENABLE, OUTPUT); digitalWrite(SOLENOID_ENABLE, LOW);
   pinMode(ARDUINO_ENABLE, OUTPUT);  digitalWrite(ARDUINO_ENABLE, HIGH);
-  pinMode(SPARE_PWM, OUTPUT);  digitalWrite(SPARE_PWM, HIGH);
+  pinMode(SPARE_PWM, OUTPUT);  digitalWrite(SPARE_PWM, LOW);
 
   pinMode(LED_ACTIVE, OUTPUT);    digitalWrite(LED_ACTIVE, LOW);
   pinMode(LED_TIMEOUT, OUTPUT);   digitalWrite(LED_TIMEOUT, LOW);
@@ -200,6 +201,7 @@ void state1() {
 void state2() {
   if (machine.executeOnce) {
     //Serial.println("State 2 - Alarm Activated");
+    alarmAlarmTimer.start();
     digitalWrite(SOUND_BOMB, HIGH);
     digitalWrite(LED_TIMEOUT, LOW); // Disable the TIMEOUT led.
     #ifdef DISPLAY_SUPPORTED
@@ -294,6 +296,7 @@ void state5() {
       display.clearDisplay();
       oledText("UNDER", 5, 2, 4, true);
     #endif
+    //digitalWrite(SOLENOID_ENABLE, LOW); // Disable the solenoid.
   }
 
   //Serial.print("Under Voltage - ");
@@ -327,6 +330,7 @@ void state6() {
       display.clearDisplay();
       oledText("OVER", 18, 2, 4, true);
     #endif
+    //digitalWrite(SOLENOID_ENABLE, LOW); // Disable the solenoid.
   }
 
   //Serial.print("Over Voltage - ");
@@ -448,7 +452,10 @@ bool transitionS1S3() {
 
 bool transitionS2S9() {
   // Check if the alarm disable button is pressed.
-  return digitalRead(INPUT_ALARM_DISABLE) == LOW;
+  if(digitalRead(INPUT_ALARM_DISABLE) == LOW)
+    return true;
+
+  return (alarmAlarmTimer.done()) ? true : false;
 }
 
 bool transitionS3S4() {

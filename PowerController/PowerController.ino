@@ -1,9 +1,9 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <StateMachine.h>
+#include <neotimer.h>
 
 #define SPARE               2     // Currently unused.
-#include <neotimer.h>
 #define SOUND_BOMB          3     // The external burglar alarm
 #define LIGHTING_ENABLE     4     // Emergency lighting.
 #define SPARE_PWM           5     // Currently unused.
@@ -152,7 +152,7 @@ void state0() {
       oledText("V2.0", 16, 2, 4, true);
     #endif
 
-    tone(BUZZER_ENABLE, 1000);
+    tone(BUZZER_ENABLE, 1500);
     delay(100);
     tone(BUZZER_ENABLE, 2000);
     delay(100);
@@ -183,19 +183,25 @@ void state1() {
 
   char buf[9];
   sprintf(buf, "%02d:%02d:%02d", runHours, runMinutes, runSeconds);
+
   #ifdef DISPLAY_SUPPORTED
     display.fillRect(0, 18, 128, 32, BLACK);
-    oledText(buf, 15, 18, 2, true);
+    oledText(buf, 15, 18, 2, false);
   #endif
-  //Serial.print("ALARM: ");
-  //Serial.println(buf);
 
   #ifdef BUZZER_SUPPORTED
-    tone(BUZZER_ENABLE, 1000);
+    tone(BUZZER_ENABLE, 1500);
     delay(200);
     noTone(BUZZER_ENABLE);
   #endif
-  
+
+  #ifdef DISPLAY_SUPPORTED
+    display.display();
+  #endif
+
+  //Serial.print("ALARM: ");
+  //Serial.println(buf);
+
 }
 
 void state2() {
@@ -237,12 +243,6 @@ void state3() {
 
   char buf[9];
   sprintf(buf, "%02d:%02d:%02d", runHours, runMinutes, runSeconds);
-  #ifdef DISPLAY_SUPPORTED
-    display.fillRect(0, 18, 128, 32, BLACK);
-    oledText(buf, 15, 18, 2, true);
-  #endif
-  //Serial.print("TIMEOUT: ");
-  //Serial.println(buf);
 
   #ifdef BUZZER_SUPPORTED
     if (secsRemaining <= 10 && secsRemaining % 2 == 0)
@@ -252,6 +252,13 @@ void state3() {
       noTone(BUZZER_ENABLE);
     }
   #endif
+
+  #ifdef DISPLAY_SUPPORTED
+    display.fillRect(0, 18, 128, 32, BLACK);
+    oledText(buf, 15, 18, 2, true);
+  #endif
+  //Serial.print("TIMEOUT: ");
+  //Serial.println(buf);
 
 }
 

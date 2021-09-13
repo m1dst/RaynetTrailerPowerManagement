@@ -28,17 +28,17 @@
 
 float noSolenoidVoltageLevel = 6;
 
+unsigned int voltageSampleCount = 0;
+
 float batteryVoltage = 12;
 unsigned int batterySum = 0;
-unsigned int batterySampleCount = 0;
 float batteryVoltageMax = 14.5;
-float batteryVoltageMin = 11.0;
+float batteryVoltageMin = 10.0;
 
 float busVoltage = 12;
 int busSum = 0;
-unsigned int busSampleCount = 0;
 float busVoltageMax = 14.5;
-float busVoltageMin = 11.0;
+float busVoltageMin = 10.0;
 
 Neotimer splashTimer = Neotimer(2000); // 2s
 Neotimer startupTimer = Neotimer(30000); // 30s
@@ -138,8 +138,7 @@ void setup()   {
 void loop()
 {
   machine.run();
-  UpdateBatteryVoltage();
-  UpdateBusVoltage();
+  //Serial.print(machine.currentState);
 }
 
 //=======================================
@@ -245,9 +244,17 @@ void state3() {
   sprintf(buf, "%02d:%02d:%02d", runHours, runMinutes, runSeconds);
 
   #ifdef BUZZER_SUPPORTED
+
+    if (secsRemaining > 10 && secsRemaining % 5 == 0)
+    {
+      tone(BUZZER_ENABLE, 2000);
+      delay(50);
+      noTone(BUZZER_ENABLE);
+    }
+  
     if (secsRemaining <= 10 && secsRemaining % 2 == 0)
     {
-      tone(BUZZER_ENABLE, 1500);
+      tone(BUZZER_ENABLE, 2000);
       delay(200);
       noTone(BUZZER_ENABLE);
     }
@@ -276,10 +283,12 @@ void state4() {
     #endif
   }
 
+  UpdateVoltages();
+
   #ifdef DISPLAY_SUPPORTED
     display.clearDisplay();
     char buf[9];
-    dtostrf(batteryVoltage, 5, 2, buf);
+    dtostrf(busVoltage, 5, 2, buf);
     strncat(buf, "V", 2);
     oledText(buf, 2, 2, 4, true);
   #endif
@@ -324,6 +333,8 @@ void state5() {
     //Serial.println(")");
   }
 
+  UpdateVoltages();
+
 }
 
 void state6() {
@@ -358,6 +369,8 @@ void state6() {
     //Serial.println(")");
   }
 
+  UpdateVoltages();
+
 }
 
 void state7() {
@@ -377,6 +390,8 @@ void state7() {
 
     digitalWrite(LIGHTING_ENABLE, HIGH); // Enable the emergency lighting.
   }
+
+  UpdateVoltages();
 }
 
 void state8() {
@@ -401,13 +416,7 @@ void state8() {
 
   char buf[9];
   sprintf(buf, "%02d:%02d:%02d", runHours, runMinutes, runSeconds);
-  #ifdef DISPLAY_SUPPORTED
-    display.fillRect(0, 18, 128, 32, BLACK);
-    oledText(buf, 15, 18, 2, true);
-  #endif
-  //Serial.print("SHUTDOWN: ");
-  //Serial.println(buf);
-
+  
   #ifdef BUZZER_SUPPORTED
     if (secsRemaining <= 10 && secsRemaining % 2 == 0)
     {
@@ -416,6 +425,13 @@ void state8() {
       noTone(BUZZER_ENABLE);
     }
   #endif
+  
+  #ifdef DISPLAY_SUPPORTED
+    display.fillRect(0, 18, 128, 32, BLACK);
+    oledText(buf, 15, 18, 2, true);
+  #endif
+  //Serial.print("SHUTDOWN: ");
+  //Serial.println(buf);
   
 }
 
@@ -426,7 +442,6 @@ void state9() {
         display.clearDisplay();
         oledText("QRT!", 22, 2, 4, true);
       #endif
-      digitalWrite(ARDUINO_ENABLE, LOW);
       digitalWrite(LIGHTING_ENABLE, LOW);
       digitalWrite(BUZZER_ENABLE, LOW);
       digitalWrite(SOLENOID_ENABLE, LOW);
@@ -435,6 +450,7 @@ void state9() {
       digitalWrite(LED_ACTIVE, LOW);
       digitalWrite(LED_TIMEOUT, LOW);
       digitalWrite(LED_OVERRIDE, LOW);
+      digitalWrite(ARDUINO_ENABLE, LOW);
     }
 }
 
@@ -523,7 +539,10 @@ bool transitionS8S4() {
 bool transitionS8S9() {
   // We debounce the stop button by ignoring it for the first 2 seconds.
   if(shutdownTimer.getEllapsed() > 2000 && digitalRead(INPUT_STOP_BUTTON) == LOW)
+  {
+
     return true;
+    }
 
   return (shutdownTimer.done()) ? true : false;
 }
@@ -560,28 +579,21 @@ char* getVoltageString(double value, int len, int precision)
   return outstr;
 }
 
-void UpdateBatteryVoltage()
+void UpdateVoltages()
 {
   // Update the battery voltage average.
-  while (batterySampleCount < NUM_SAMPLES) {
+  while (voltageSampleCount < NUM_SAMPLES) {
     batterySum += analogRead(INPUT_BATTERY_SENSE);
-    batterySampleCount ++;
-  }
-  batteryVoltage = ((float)batterySum / (float)NUM_SAMPLES * 5.1) / 1024.0;
-  batteryVoltage = batteryVoltage * 11.365;  // Calibration fix.
-  batterySum = 0;
-  batterySampleCount = 0;
-}
-
-void UpdateBusVoltage()
-{
-  // Update the bus voltage average.
-  while (busSampleCount < NUM_SAMPLES) {
     busSum += analogRead(INPUT_BUS_SENSE);
-    busSampleCount ++;
+    voltageSampleCount ++;
+    delay(5);
   }
-  busVoltage = ((float)busSum / (float)NUM_SAMPLES * 5.1) / 1024.0;
-  busVoltage = busVoltage * 11.42;  // Calibration fix.
+  
+  batteryVoltage = ((float)batterySum / (float)NUM_SAMPLES * 5.0) / 1024.0;
+  batteryVoltage = batteryVoltage * 11.0;  // Calibration fix.
+  busVoltage = ((float)busSum / (float)NUM_SAMPLES * 5.0) / 1024.0;
+  busVoltage = busVoltage * 11.0;  // Calibration fix.
+  batterySum = 0;
   busSum = 0;
-  busSampleCount = 0;
+  voltageSampleCount = 0;
 }
